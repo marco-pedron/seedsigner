@@ -1,7 +1,7 @@
 [submodule "src/seedsigner/resources/seedsigner-translations"]
 	path = src/seedsigner/resources/seedsigner-translations
-	url = https://github.com/SeedSigner/seedsigner-translations.git
-	branch = dev
+	url = https://github.com/marco-pedron/seedsigner-translations.git
+	branch = bitpolito-it-tr
 [submodule "seedsigner-screenshots"]
 	path = seedsigner-screenshots
 	url = https://github.com/SeedSigner/seedsigner-screenshots.git
