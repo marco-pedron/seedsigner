@@ -64,6 +64,12 @@ Use a deterministic camera fixture:
 The default configuration is ST7789 240x240. The simulator validates the
 rendered RGB framebuffer and keeps settings in a temporary directory.
 
+Headless smoke flows wait until the app is idle on the main menu, with no toast
+on screen, before pressing any button: a toast polls the buttons too and would
+swallow a fast press. Each press must produce a new frame or View, and the
+`settings` flow must end on `SettingsMenuView`, so a slow machine fails loudly
+instead of navigating somewhere else.
+
 ## Safety
 
 A desktop is not air-gapped and does not reproduce Raspberry Pi hardware

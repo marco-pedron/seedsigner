@@ -20,7 +20,7 @@ from tools.simulator.adapters import (
     SimulatorCamera,
     image_from_payload,
 )
-from tools.simulator.runtime import simulator_runtime
+from tools.simulator.runtime import simulator_runtime, status_reporting
 from tools.simulator.web_ui import SimulatorWebServer
 
 
@@ -135,6 +135,68 @@ def test_runtime_patches_display_factory_without_touching_driver_api():
     assert isinstance(display, QueueDisplay)
     assert display.width == 240
     assert display.height == 240
+
+
+def test_runtime_reports_app_progress_only_when_requested():
+    class ProbeView:
+        has_redirect = False
+
+        def run(self):
+            return "probe-result"
+
+    def progress_hooks():
+        from seedsigner.gui.toast import BaseToastOverlayManagerThread
+        from seedsigner.views.screensaver import ScreensaverScreen
+        from seedsigner.views.view import Destination
+
+        return (
+            Destination.run,
+            BaseToastOverlayManagerThread.run,
+            ScreensaverScreen.start,
+        )
+
+    status = Queue()
+    with simulator_runtime(Queue(maxsize=2), Queue()):
+        originals = progress_hooks()
+        with status_reporting(None):
+            assert progress_hooks() == originals
+
+        with status_reporting(status):
+            from seedsigner.views.view import Destination
+
+            patched = progress_hooks()
+            assert all(hook is not original for hook, original in zip(patched, originals))
+            assert Destination(ProbeView).run() == "probe-result"
+
+        assert progress_hooks() == originals
+
+    assert status.get_nowait() == ("view", "ProbeView")
+    assert status.empty()
+
+
+def test_smoke_input_waits_for_the_main_menu_and_finished_toasts():
+    from tools.simulator.run_simulator import SMOKE_FLOW_KEYS, SmokeAppState
+
+    state = SmokeAppState()
+    state.apply("toast-start", "RemoveSDCardToastManagerThread")
+    assert not state.is_ready_for("settings")
+
+    # A fast press sent now would be consumed by the toast, not the menu.
+    state.apply("view", "MainMenuView")
+    assert not state.is_ready_for("settings")
+
+    state.apply("toast-end", "RemoveSDCardToastManagerThread")
+    assert state.is_ready_for("settings")
+    assert state.is_ready_for("scan")
+    assert not state.is_ready_for("screensaver")
+
+    state.apply("screensaver", "start")
+    assert state.is_ready_for("screensaver")
+
+    state.apply("view", "SettingsMenuView")
+    assert state.current_view == "SettingsMenuView"
+    assert not state.is_ready_for("settings")
+    assert SMOKE_FLOW_KEYS["settings"] == ("KEY_DOWN", "KEY_RIGHT", "KEY_PRESS")
 
 
 def test_browser_ui_serves_real_frames_and_forwards_gpio_events():

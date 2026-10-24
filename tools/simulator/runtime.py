@@ -1,6 +1,6 @@
 """Runtime patch boundary for the development-only simulator."""
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -38,6 +38,66 @@ def _restore_modules(originals: dict[str, Any]):
             sys.modules.pop(name, None)
         else:
             sys.modules[name] = original
+
+
+@contextmanager
+def status_reporting(status_queue: Any = None):
+    """Report app progress to the smoke driver without changing app behavior.
+
+    Events are (kind, name) tuples: ("view", View class name) when the Controller
+    runs a View, ("toast-start"/"toast-end", toast class name) around each toast
+    thread and ("screensaver", "start") when the screensaver takes over.
+
+    Enter it only after Settings are configured: importing the GUI modules
+    reads Settings (e.g. default fonts for the locale) at import time.
+    """
+    if status_queue is None:
+        yield
+        return
+    with ExitStack() as stack:
+        for patcher in _status_patchers(status_queue):
+            stack.enter_context(patcher)
+        yield
+
+
+def _status_patchers(status_queue: Any) -> list:
+    from seedsigner.gui.toast import BaseToastOverlayManagerThread
+    from seedsigner.views.screensaver import ScreensaverScreen
+    from seedsigner.views.view import Destination
+
+    original_destination_run = Destination.run
+    original_toast_run = BaseToastOverlayManagerThread.run
+    original_screensaver_start = ScreensaverScreen.start
+
+    def report(kind: str, name: str):
+        try:
+            status_queue.put_nowait((kind, name))
+        except Exception:
+            # Status reporting is diagnostic only; never break the app over it.
+            pass
+
+    def destination_run(self):
+        if self.View_cls is not None:
+            report("view", self.View_cls.__name__)
+        return original_destination_run(self)
+
+    def toast_run(self):
+        report("toast-start", self.__class__.__name__)
+        try:
+            return original_toast_run(self)
+        finally:
+            report("toast-end", self.__class__.__name__)
+
+    def screensaver_start(self):
+        if not self.is_running:
+            report("screensaver", "start")
+        return original_screensaver_start(self)
+
+    return [
+        patch.object(Destination, "run", destination_run),
+        patch.object(BaseToastOverlayManagerThread, "run", toast_run),
+        patch.object(ScreensaverScreen, "start", screensaver_start),
+    ]
 
 
 @contextmanager
@@ -116,6 +176,7 @@ def run_application(
     input_queue: Any,
     error_queue: Any,
     config: dict[str, Any],
+    status_queue: Any = None,
 ):
     """Child-process entry point that runs the real SeedSigner main loop."""
     try:
@@ -143,9 +204,10 @@ def run_application(
             settings._data[SettingsConstants.SETTING__LOCALE] = config["locale"]
             settings.load_locale()
 
-            from main import main
+            with status_reporting(status_queue):
+                from main import main
 
-            main([])
+                main([])
     except BaseException:
         error_queue.put(traceback.format_exc())
         raise

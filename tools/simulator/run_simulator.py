@@ -182,11 +182,64 @@ def stop_process(process):
         process.join(timeout=2)
 
 
+# Key presses sent once the app is ready; each one must produce a response.
+SMOKE_FLOW_KEYS = {
+    "startup": (),
+    "settings": ("KEY_DOWN", "KEY_RIGHT", "KEY_PRESS"),
+    "scan": ("KEY_PRESS",),
+    "screensaver": ("KEY_PRESS",),
+}
+# View the Controller must be running when the flow ends.
+SMOKE_FLOW_FINAL_VIEW = {
+    "startup": "MainMenuView",
+    "settings": "SettingsMenuView",
+}
+SMOKE_KEY_RESPONSE_TIMEOUT = 3.0
+SMOKE_SETTLE_SECONDS = 0.5
+SMOKE_QUIET_SECONDS = 2.5
+
+
+class SmokeAppState:
+    """Tracks the status events published by the simulator child process."""
+
+    def __init__(self):
+        self.views: list[str] = []
+        self.active_toasts: set[str] = set()
+        self.screensaver_started = False
+
+    def apply(self, kind: str, name: str):
+        if kind == "view":
+            self.views.append(name)
+        elif kind == "toast-start":
+            self.active_toasts.add(name)
+        elif kind == "toast-end":
+            self.active_toasts.discard(name)
+        elif kind == "screensaver":
+            self.screensaver_started = True
+
+    @property
+    def current_view(self) -> str | None:
+        return self.views[-1] if self.views else None
+
+    def is_ready_for(self, flow: str) -> bool:
+        """True once real hardware input would reach the screen under test.
+
+        A toast polls the buttons too, so a fast press sent while it is active
+        is consumed by the toast instead of the main menu.
+        """
+        if self.current_view != "MainMenuView" or self.active_toasts:
+            return False
+        if flow == "screensaver":
+            return self.screensaver_started
+        return True
+
+
 def run_headless_smoke(
     process,
     frame_queue,
     input_queue,
     error_queue,
+    status_queue,
     timeout,
     screenshot,
     flow,
@@ -196,32 +249,25 @@ def run_headless_smoke(
 
     started_at = time.monotonic()
     deadline = started_at + timeout
+    state = SmokeAppState()
+    pending_keys = list(SMOKE_FLOW_KEYS[flow])
     last_payload = None
     frame_count = 0
     flow_frame_count = 0
     last_frame_at = None
-    action_sent = flow == "startup"
+    ready_at = None
+    awaiting_key = None
+    key_sent_at = None
+    frames_at_key = 0
+    views_at_key = 0
     required_flow_frames = 1 if flow == "screensaver" else 3
 
     while time.monotonic() < deadline:
-        now = time.monotonic()
-        if flow != "startup" and not action_sent and now - started_at >= (35.0 if flow == "screensaver" else 4.0):
-            pins = (
-                (
-                    SimulatorButtonPins.KEY_DOWN,
-                    SimulatorButtonPins.KEY_RIGHT,
-                    SimulatorButtonPins.KEY_PRESS,
-                )
-                if flow == "settings"
-                else (SimulatorButtonPins.KEY_PRESS,)
-            )
-            for pin in pins:
-                # Deliberately enqueue an immediate LOW/HIGH pair. This verifies
-                # the desktop GPIO latch, not a forgiving artificial key hold.
-                input_queue.put((pin, 0))
-                input_queue.put((pin, 1))
-            action_sent = True
-            last_frame_at = now
+        while True:
+            try:
+                state.apply(*status_queue.get_nowait())
+            except Empty:
+                break
 
         try:
             error = error_queue.get_nowait()
@@ -230,35 +276,95 @@ def run_headless_smoke(
         if error:
             raise RuntimeError(f"Simulator application failed:\n{error}")
 
+        now = time.monotonic()
+        if awaiting_key is not None:
+            if frame_count > frames_at_key or len(state.views) > views_at_key:
+                awaiting_key = None
+            elif now - key_sent_at >= SMOKE_KEY_RESPONSE_TIMEOUT:
+                raise RuntimeError(
+                    f"Simulator did not respond to {awaiting_key} during {flow} "
+                    f"(current view: {state.current_view})"
+                )
+
+        if ready_at is None and pending_keys and state.is_ready_for(flow):
+            ready_at = now
+            # The timeout covers the flow itself, not the time spent booting.
+            deadline = max(deadline, ready_at + timeout)
+
+        # The screensaver animates continuously, so it never settles.
+        settled = flow == "screensaver" or (
+            last_frame_at is not None and now - last_frame_at >= SMOKE_SETTLE_SECONDS
+        )
+        if ready_at is not None and pending_keys and awaiting_key is None and settled:
+            key_name = pending_keys.pop(0)
+            pin = getattr(SimulatorButtonPins, key_name)
+            # Deliberately enqueue an immediate LOW/HIGH pair. This verifies
+            # the desktop GPIO latch, not a forgiving artificial key hold.
+            input_queue.put((pin, 0))
+            input_queue.put((pin, 1))
+            awaiting_key = key_name
+            key_sent_at = now
+            frames_at_key = frame_count
+            views_at_key = len(state.views)
+
         try:
-            payload = frame_queue.get(timeout=0.25)
+            payload = frame_queue.get(timeout=0.1)
         except Empty:
             if process.exitcode not in (None, 0):
                 raise RuntimeError(
                     f"Simulator process exited with code {process.exitcode}"
                 )
-            required_frames = 2 if flow == "startup" else required_flow_frames
-            observed_frames = frame_count if flow == "startup" else flow_frame_count
+            if flow == "startup":
+                done = (
+                    frame_count >= 2
+                    and state.current_view == "MainMenuView"
+                )
+            else:
+                done = (
+                    ready_at is not None
+                    and not pending_keys
+                    and awaiting_key is None
+                    and flow_frame_count >= required_flow_frames
+                )
             if (
-                action_sent
+                done
                 and last_frame_at is not None
-                and observed_frames >= required_frames
-                and time.monotonic() - last_frame_at >= 2.5
+                and time.monotonic() - last_frame_at >= SMOKE_QUIET_SECONDS
             ):
                 break
             continue
 
         last_payload = payload
         frame_count += 1
-        if flow != "startup" and action_sent:
+        if ready_at is not None and key_sent_at is not None:
             flow_frame_count += 1
         last_frame_at = time.monotonic()
 
     if last_payload is None:
         raise RuntimeError("Simulator produced no display frames")
+    if flow != "startup" and (pending_keys or awaiting_key is not None):
+        raise RuntimeError(
+            f"Simulator was not ready for the {flow} input before the timeout "
+            f"(current view: {state.current_view}, "
+            f"active toasts: {sorted(state.active_toasts)})"
+        )
     if flow != "startup" and flow_frame_count < required_flow_frames:
         raise RuntimeError(
             f"Simulator did not render the expected navigation frames for {flow}"
+        )
+    expected_view = SMOKE_FLOW_FINAL_VIEW.get(flow)
+    if expected_view and state.current_view != expected_view:
+        raise RuntimeError(
+            f"Simulator ended the {flow} flow on {state.current_view}, "
+            f"expected {expected_view} (views: {' > '.join(state.views)})"
+        )
+    if flow == "scan" and (
+        "ScanView" not in state.views or state.current_view == "ScanView"
+    ):
+        # The camera frame must be decoded and routed past the scanner.
+        raise RuntimeError(
+            f"Simulator did not decode the camera image "
+            f"(views: {' > '.join(state.views)})"
         )
 
     frame = image_from_payload(last_payload)
@@ -275,7 +381,8 @@ def run_headless_smoke(
     print(
         "SIMULATOR_SMOKE_OK "
         f"flow={flow} frames={frame_count} "
-        f"size={frame.width}x{frame.height} mode={frame.mode}"
+        f"size={frame.width}x{frame.height} mode={frame.mode} "
+        f"view={state.current_view}"
     )
 
 
@@ -301,6 +408,7 @@ def main():
     frame_queue = context.Queue(maxsize=3)
     input_queue = context.Queue()
     error_queue = context.Queue()
+    status_queue = context.Queue() if args.headless_smoke else None
 
     with tempfile.TemporaryDirectory(prefix="bitpolito-simulator-") as runtime_dir:
         config = {
@@ -311,7 +419,7 @@ def main():
         }
         process = context.Process(
             target=run_application,
-            args=(frame_queue, input_queue, error_queue, config),
+            args=(frame_queue, input_queue, error_queue, config, status_queue),
             name="BitPolitoSeedSigner",
         )
         process.start()
@@ -323,6 +431,7 @@ def main():
                     frame_queue,
                     input_queue,
                     error_queue,
+                    status_queue,
                     args.smoke_timeout,
                     args.screenshot,
                     args.smoke_flow,
