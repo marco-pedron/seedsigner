@@ -6,6 +6,7 @@ from types import ModuleType
 from typing import Any
 from unittest.mock import patch
 import os
+import shutil
 import sys
 import traceback
 
@@ -111,6 +112,32 @@ def simulator_runtime(
         _restore_modules(originals)
 
 
+def load_simulator_settings(runtime_dir: Path, config: dict[str, Any]):
+    """Create the Settings singleton the way SeedSigner OS boots it.
+
+    With `settings_json` the file is copied into the temporary runtime
+    directory and read like `/mnt/microsd/settings.json`; the source file is
+    never written. `display_config` and `locale` override it only when set.
+    """
+    from seedsigner.models.settings import Settings
+    from seedsigner.models.settings_definition import SettingsConstants
+
+    settings_filename = Path(runtime_dir) / "settings.json"
+    if config.get("settings_json"):
+        shutil.copyfile(config["settings_json"], settings_filename)
+    Settings.SETTINGS_FILENAME = str(settings_filename)
+    Settings.HOSTNAME = "bitpolito-simulator"
+    settings = Settings.get_instance()
+    if config.get("display_config"):
+        settings._data[SettingsConstants.SETTING__DISPLAY_CONFIGURATION] = (
+            config["display_config"]
+        )
+    if config.get("locale"):
+        settings._data[SettingsConstants.SETTING__LOCALE] = config["locale"]
+    settings.load_locale()
+    return settings
+
+
 def run_application(
     frame_queue: Any,
     input_queue: Any,
@@ -131,17 +158,7 @@ def run_application(
             input_queue,
             camera_image=config.get("camera_image"),
         ):
-            from seedsigner.models.settings import Settings
-            from seedsigner.models.settings_definition import SettingsConstants
-
-            Settings.SETTINGS_FILENAME = str(runtime_dir / "settings.json")
-            Settings.HOSTNAME = "bitpolito-simulator"
-            settings = Settings.get_instance()
-            settings._data[SettingsConstants.SETTING__DISPLAY_CONFIGURATION] = (
-                config["display_config"]
-            )
-            settings._data[SettingsConstants.SETTING__LOCALE] = config["locale"]
-            settings.load_locale()
+            load_simulator_settings(runtime_dir, config)
 
             from main import main
 

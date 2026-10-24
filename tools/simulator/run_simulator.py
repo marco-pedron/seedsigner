@@ -2,6 +2,7 @@
 """Run BitPolito SeedSigner with development-only hardware adapters."""
 
 import argparse
+import json
 import multiprocessing
 import os
 import subprocess
@@ -69,7 +70,18 @@ def parse_args():
         choices=SUPPORTED_DISPLAY_CONFIGS,
         help="Official SeedSigner display configuration (default: st7789_240x240).",
     )
-    parser.add_argument("--locale", default="en")
+    display_group.add_argument(
+        "--settings-json",
+        type=Path,
+        help=(
+            "Boot from a copy of this settings.json, as SeedSigner OS reads it "
+            "from the microSD card; its display_config is not overridden."
+        ),
+    )
+    parser.add_argument(
+        "--locale",
+        help="Override the locale (default: the settings value, English).",
+    )
     parser.add_argument("--scale", type=int, choices=(1, 2, 3, 4), default=2)
     parser.add_argument(
         "--ui",
@@ -103,7 +115,27 @@ def parse_args():
 
 
 def resolve_display_config(args) -> str:
+    if args.settings_json:
+        return display_config_from_settings_file(args.settings_json)
     return args.display_config or "st7789_240x240"
+
+
+def display_config_from_settings_file(path: Path) -> str:
+    """Return the display the app will select from a microSD settings.json."""
+    try:
+        data = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"Cannot read settings file {path}: {exc}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"Settings file {path} must contain a JSON object")
+
+    display_config = data.get("display_config", "st7789_240x240")
+    if display_config not in SUPPORTED_DISPLAY_CONFIGS:
+        raise SystemExit(
+            f"Unsupported display_config {display_config!r} in {path}; "
+            f"expected one of {', '.join(SUPPORTED_DISPLAY_CONFIGS)}"
+        )
+    return display_config
 
 
 def physical_display_size(display_config: str) -> tuple[int, int]:
@@ -294,6 +326,8 @@ def main():
     selected_ui = None
     if not args.headless_smoke:
         selected_ui = select_interactive_ui(args.ui)
+    if args.settings_json:
+        args.settings_json = args.settings_json.expanduser().resolve()
     if args.camera_image:
         args.camera_image = args.camera_image.expanduser().resolve()
         if not args.camera_image.is_file():
@@ -312,8 +346,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix="bitpolito-simulator-") as runtime_dir:
         config = {
             "runtime_dir": runtime_dir,
-            "display_config": display_config,
+            "display_config": None if args.settings_json else display_config,
             "locale": args.locale,
+            "settings_json": str(args.settings_json) if args.settings_json else None,
             "camera_image": str(args.camera_image) if args.camera_image else None,
         }
         process = context.Process(
