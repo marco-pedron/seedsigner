@@ -418,3 +418,100 @@ def test_settings_json_boots_like_the_microsd_file_without_writing_it(tmp_path):
     assert source.read_bytes() == original
     persisted = json.loads((runtime_dir / "settings.json").read_text())
     assert persisted[SettingsConstants.SETTING__DISPLAY_CONFIGURATION] == "st7789_320x240"
+
+
+SHIELDSIGNER_DOCS = REPO_ROOT / "docs" / "bitpolito-shieldsigner"
+
+
+def test_shieldsigner_settings_files_select_the_documented_displays():
+    from tools.simulator.run_simulator import display_config_from_settings_file
+
+    expected = {
+        "settings.json": ("st7789_320x240", None),
+        "settings-inverted.json": ("st7789_320x240", "E"),
+        "settings-ili9341.json": ("ili9341_320x240", None),
+    }
+    assert sorted(path.name for path in SHIELDSIGNER_DOCS.glob("*.json")) == sorted(expected)
+    for name, (display_config, color_inverted) in expected.items():
+        path = SHIELDSIGNER_DOCS / name
+        data = json.loads(path.read_text())
+        assert data["persistent_settings"] == "E"
+        assert data.get("color_inverted") == color_inverted
+        assert display_config_from_settings_file(path) == display_config
+
+
+def test_shieldsigner_settingsqr_switches_to_the_large_display(tmp_path):
+    from pyzbar.pyzbar import decode
+    from seedsigner.models.settings import Settings
+    from seedsigner.models.settings_definition import SettingsConstants
+
+    qr_image = SHIELDSIGNER_DOCS / "settingsqr-st7789_320x240.png"
+    data = decode(Image.open(qr_image))[0].data.decode()
+    assert data == "settings::v1 name=ShieldSigner persistent=E disp_conf=st7789_320x240"
+
+    frames = Queue(maxsize=1)
+    previous_filename = Settings.SETTINGS_FILENAME
+    previous_settings = Settings._instance
+    renderer_class = None
+    previous_renderer = None
+    controller_class = None
+    previous_controller = None
+
+    try:
+        Settings.SETTINGS_FILENAME = str(tmp_path / "settings.json")
+        Settings._instance = None
+        with simulator_runtime(frames, Queue()):
+            from seedsigner.controller import Controller
+            from seedsigner.gui import Renderer
+            from seedsigner.views.settings_views import SettingsIngestSettingsQRView
+
+            renderer_class = Renderer
+            previous_renderer = Renderer._instance
+            Renderer._instance = None
+            controller_class = Controller
+            previous_controller = Controller._instance
+            Controller._instance = None
+            settings = Settings.get_instance()
+            with patch("seedsigner.controller.BackgroundImportThread.start"):
+                Controller.get_instance()
+            renderer = Renderer.get_instance()
+            assert (renderer.disp.width, renderer.disp.height) == (240, 240)
+
+            SettingsIngestSettingsQRView(data)
+
+            assert settings.get_value(
+                SettingsConstants.SETTING__DISPLAY_CONFIGURATION
+            ) == "st7789_320x240"
+            assert (renderer.canvas_width, renderer.canvas_height) == (320, 240)
+            assert (renderer.disp.width, renderer.disp.height) == (320, 240)
+            assert renderer.disp.inverted is False
+
+            persisted = json.loads(Path(Settings.SETTINGS_FILENAME).read_text())
+            assert persisted[SettingsConstants.SETTING__DISPLAY_CONFIGURATION] == "st7789_320x240"
+    finally:
+        Settings.SETTINGS_FILENAME = previous_filename
+        Settings._instance = previous_settings
+        if renderer_class is not None:
+            renderer_class._instance = previous_renderer
+        if controller_class is not None:
+            controller_class._instance = previous_controller
+
+
+def test_shieldsigner_settingsqr_images_match_the_guide():
+    from pyzbar.pyzbar import decode
+    from seedsigner.models.settings import Settings
+
+    expected = {
+        "settingsqr-st7789_320x240.png": ("st7789_320x240", None),
+        "settingsqr-st7789_320x240-inverted.png": ("st7789_320x240", "E"),
+        "settingsqr-ili9341_320x240.png": ("ili9341_320x240", None),
+    }
+    guide = (REPO_ROOT / "docs" / "bitpolito-shieldsigner.md").read_text()
+    assert sorted(path.name for path in SHIELDSIGNER_DOCS.glob("*.png")) == sorted(expected)
+    for name, (display_config, color_inverted) in expected.items():
+        data = decode(Image.open(SHIELDSIGNER_DOCS / name))[0].data.decode()
+        assert f"| `{name}` | `{data}` |" in guide
+        _config_name, settings_update = Settings.parse_settingsqr(data)
+        assert settings_update["display_config"] == display_config
+        assert settings_update.get("color_inverted") == color_inverted
+        assert settings_update["persistent_settings"] == "E"
