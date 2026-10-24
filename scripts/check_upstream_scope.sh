@@ -105,6 +105,12 @@ while IFS= read -r path; do
         design/*|\
         docs/bitpolito-*)
             ;;
+        # Modifica di policy da far approvare al team BitPolito: the
+        # translations submodule tracks the marco-pedron fork, so only its
+        # URL/branch in .gitmodules and the submodule pointer may change.
+        .gitmodules|\
+        src/seedsigner/resources/seedsigner-translations)
+            ;;
         *)
             echo "Out-of-scope change relative to SeedSigner 0.8.7: ${path}" >&2
             exit 1
