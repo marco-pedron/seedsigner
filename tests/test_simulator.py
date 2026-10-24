@@ -10,6 +10,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from tools.simulator.adapters import (
@@ -419,3 +420,63 @@ def test_settingsqr_applies_display_immediately_and_persists_hardware_values(tmp
             renderer_class._instance = previous_renderer
         if controller_class is not None:
             controller_class._instance = previous_controller
+
+
+def test_settings_json_display_is_read_and_validated(tmp_path):
+    from tools.simulator.run_simulator import display_config_from_settings_file
+
+    shieldsigner = tmp_path / "shieldsigner.json"
+    shieldsigner.write_text('{"persistent_settings": "E", "display_config": "st7789_320x240"}')
+    assert display_config_from_settings_file(shieldsigner) == "st7789_320x240"
+
+    without_display = tmp_path / "defaults.json"
+    without_display.write_text('{"persistent_settings": "E"}')
+    assert display_config_from_settings_file(without_display) == "st7789_240x240"
+
+    unsupported = tmp_path / "unsupported.json"
+    unsupported.write_text('{"display_config": "st7789_320x480"}')
+    with pytest.raises(SystemExit, match="Unsupported display_config"):
+        display_config_from_settings_file(unsupported)
+
+    typographic_quotes = tmp_path / "textedit.json"
+    typographic_quotes.write_text("{“display_config”: “st7789_320x240”}")
+    with pytest.raises(SystemExit, match="Cannot read settings file"):
+        display_config_from_settings_file(typographic_quotes)
+
+
+def test_settings_json_boots_like_the_microsd_file_without_writing_it(tmp_path):
+    from seedsigner.models.settings import Settings
+    from seedsigner.models.settings_definition import SettingsConstants
+    from tools.simulator.runtime import load_simulator_settings
+
+    source = tmp_path / "microsd" / "settings.json"
+    source.parent.mkdir()
+    source.write_text('{"persistent_settings": "E", "display_config": "st7789_320x240"}\n')
+    original = source.read_bytes()
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    previous = (Settings.SETTINGS_FILENAME, Settings.HOSTNAME, Settings._instance)
+
+    try:
+        Settings._instance = None
+        with simulator_runtime(Queue(maxsize=1), Queue()):
+            settings = load_simulator_settings(
+                runtime_dir,
+                {"settings_json": str(source), "display_config": None, "locale": None},
+            )
+            assert settings.get_value(
+                SettingsConstants.SETTING__DISPLAY_CONFIGURATION
+            ) == "st7789_320x240"
+            assert settings.get_value(
+                SettingsConstants.SETTING__PERSISTENT_SETTINGS
+            ) == SettingsConstants.OPTION__ENABLED
+            assert settings.get_value(
+                SettingsConstants.SETTING__DISPLAY_COLOR_INVERTED
+            ) == SettingsConstants.OPTION__DISABLED
+            assert settings.get_value(SettingsConstants.SETTING__LOCALE) == "en"
+    finally:
+        Settings.SETTINGS_FILENAME, Settings.HOSTNAME, Settings._instance = previous
+
+    assert source.read_bytes() == original
+    persisted = json.loads((runtime_dir / "settings.json").read_text())
+    assert persisted[SettingsConstants.SETTING__DISPLAY_CONFIGURATION] == "st7789_320x240"

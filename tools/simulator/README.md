@@ -53,6 +53,18 @@ Choose an official display configuration:
 .venv-simulator/bin/python tools/simulator/run_simulator.py --display-config ili9341_320x240
 ~~~
 
+Boot from the `settings.json` you will copy to the microSD card. The app reads
+a temporary copy exactly as SeedSigner OS reads `/mnt/microsd/settings.json`,
+so its `display_config`, `color_inverted` and `locale` apply without
+overrides; the source file is never modified. `--locale` still overrides the
+language, and `--display-config` cannot be combined with this option:
+
+~~~bash
+.venv-simulator/bin/python tools/simulator/run_simulator.py \
+  --headless-smoke --smoke-flow settings \
+  --settings-json /Volumes/<card>/settings.json
+~~~
+
 Use a deterministic camera fixture:
 
 ~~~bash
